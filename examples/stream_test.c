@@ -93,20 +93,22 @@ callback(uint8_t *buffer, int length, FTDIProgressInfo *progress, void *userdata
                return 1;
            }
        }
-   }
-   if (inputFile)
-   {
-       if (feof(outputFile)) {
-	       fseek (outputFile , 0 , SEEK_SET );
-       }
-       if (fread(buffer, length, 1, outputFile) < 1)
+       if (inputFile)
        {
-           perror("File read error");
-           return 1;
-       } else {
-//           perror("File read OK");
+           if (feof(inputFile)) {
+               fseek (inputFile , 0 , SEEK_SET );
+           }
+    
+           int len = fread(buffer, 1, length, inputFile);
+           if (len < 1){
+                   fprintf(stderr, "read %d of %d\n", len, length);
+                   perror("File read error");
+                   return 1;
+           } else {
+    //           perror("File read OK");
+           }
        }
-   }
+       }
    if (progress)
    {
        fprintf(stderr, "%10.02fs total time %9.3f MiB transferred %7.1f kB/s curr rate %7.1f kB/s totalrate %d dropouts\n",
@@ -344,7 +346,7 @@ int main(int argc, char **argv)
    int option_index;
    static struct option long_options[] = {{NULL},};
 
-   while ((c = getopt_long(argc, argv, "P:n", long_options, &option_index)) !=- 1)
+   while ((c = getopt_long(argc, argv, "P:r", long_options, &option_index)) !=- 1)
        switch (c) 
        {
        case -1:
@@ -406,7 +408,7 @@ int main(int argc, char **argv)
        }*/
    if (file){
        if (mode == READ){
-           df = fopen(file,"r");
+           df = fopen(file,"rb");
        } else {
            df = fopen(file,"w+");
        }
