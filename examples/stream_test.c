@@ -36,11 +36,15 @@ typedef struct
     FTDIProgressInfo progress;
 } FTDIStreamState;
 
-void check_outfile(char *);
-
 static FILE *outputFile;
+static FILE *inputFile;
 
-static int check = 1;
+//TODO: proper definition
+#define WRITE 0
+#define READ 1
+
+int mode = WRITE;
+
 static int exitRequested = 0;
 /*
  * sigintHandler --
@@ -61,9 +65,9 @@ usage(const char *argv0)
            "Usage: %s [options...] \n"
            "Test streaming read from FT2232H\n"
            "[-P string] only look for product with given string\n"
-           "[-n] don't check for special block structure\n"
+	   "[-r] read data from file, write to FT (default: vice-versa)\n"
            "\n"
-           "If some filename is given, write data read to that file\n"
+           "If some filename is given, use that file for reading/writing data\n"
            "Progess information is printed each second\n"
            "Abort with ^C\n"
            "\n"
@@ -75,56 +79,12 @@ usage(const char *argv0)
    exit(1);
 }
 
-static uint32_t start = 0;
-static uint32_t offset = 0;
-static uint64_t blocks = 0;
-static uint32_t skips = 0;
 static uint32_t n_err = 0;
 static int
-readCallback(uint8_t *buffer, int length, FTDIProgressInfo *progress, void *userdata)
+callback(uint8_t *buffer, int length, FTDIProgressInfo *progress, void *userdata)
 {
    if (length)
    {
-       if (check)
-       {
-           int i,rem;
-           uint32_t num;
-           for (i= offset; i<length-16; i+=16)
-           {
-               num = *(uint32_t*) (buffer+i);
-               if (start && (num != start +0x4000))
-               {
-                   uint32_t delta = ((num-start)/0x4000)-1;
-                   fprintf(stderr, "Skip %7d blocks from 0x%08x to 0x%08x at blocks %10llu\n",
-                           delta, start -0x4000, num, (unsigned long long)blocks);
-                   n_err++;
-                   skips += delta;
-               }
-               blocks ++;
-               start = num;
-           }
-           rem = length -i;
-           if (rem >3)
-           {
-               num = *(uint32_t*) (buffer+i);
-               if (start && (num != start +0x4000))
-               {
-                   uint32_t delta = ((num-start)/0x4000)-1;
-                   fprintf(stderr, "Skip %7d blocks from 0x%08x to 0x%08x at blocks %10llu\n",
-                           delta, start -0x4000, num, (unsigned long long) blocks);
-                   n_err++;
-                   skips += delta;
-               }
-               start = num;
-           }
-           else if (rem)
-               start += 0x4000;
-           if (rem != 0)
-           {
-               blocks ++;
-               offset = 16-rem;
-           }
-       }
        if (outputFile)
        {
            if (fwrite(buffer, length, 1, outputFile) != 1)
@@ -134,22 +94,7 @@ readCallback(uint8_t *buffer, int length, FTDIProgressInfo *progress, void *user
            }
        }
    }
-   if (progress)
-   {
-       fprintf(stderr, "%10.02fs total time %9.3f MiB captured %7.1f kB/s curr rate %7.1f kB/s totalrate %d dropouts\n",
-               progress->totalTime,
-               progress->current.totalBytes / (1024.0 * 1024.0),
-               progress->currentRate / 1024.0,
-               progress->totalRate / 1024.0,
-               n_err);
-   }
-   return exitRequested ? 1 : 0;
-}
-
-static int
-writeCallback(uint8_t *buffer, int length, FTDIProgressInfo *progress, void *userdata)
-{
-   if (outputFile)
+   if (inputFile)
    {
        if (feof(outputFile)) {
 	       fseek (outputFile , 0 , SEEK_SET );
@@ -157,19 +102,14 @@ writeCallback(uint8_t *buffer, int length, FTDIProgressInfo *progress, void *use
        if (fread(buffer, length, 1, outputFile) < 1)
        {
            perror("File read error");
-//           return 1;
+           return 1;
        } else {
 //           perror("File read OK");
        }
    }
-/*
-   for (int i=0; i<length; i++){
-	   buffer[i] = 0xff;
-   }
-*/
    if (progress)
    {
-       fprintf(stderr, "%10.02fs total time %9.3f MiB captured %7.1f kB/s curr rate %7.1f kB/s totalrate %d dropouts\n",
+       fprintf(stderr, "%10.02fs total time %9.3f MiB transferred %7.1f kB/s curr rate %7.1f kB/s totalrate %d dropouts\n",
                progress->totalTime,
                progress->current.totalBytes / (1024.0 * 1024.0),
                progress->currentRate / 1024.0,
@@ -186,7 +126,7 @@ TimevalDiff(const struct timeval *a, const struct timeval *b)
 }
 
 static void LIBUSB_CALL
-ftdi_writestream_cb(struct libusb_transfer *transfer)
+ftdi_stream_cb(struct libusb_transfer *transfer)
 {
     FTDIStreamState *state = transfer->user_data;
     int packet_size = state->packetsize;
@@ -236,7 +176,7 @@ ftdi_writestream_cb(struct libusb_transfer *transfer)
 }
 
 int
-ftdi_writestream(struct ftdi_context *ftdi,
+ftdi_stream(struct ftdi_context *ftdi,
                 FTDIStreamCallback *callback, void *userdata,
                 int packetsPerTransfer, int numTransfers)
 {
@@ -290,9 +230,11 @@ ftdi_writestream(struct ftdi_context *ftdi,
             goto cleanup;
         }
 
-        libusb_fill_bulk_transfer(transfer, ftdi->usb_dev, ftdi->in_ep,
+        libusb_fill_bulk_transfer(transfer, ftdi->usb_dev, 
+                                  (mode == WRITE) ? ftdi->out_ep : ftdi->in_ep,
+                                  //TODO: don't send empty buffers in first batch
                                   malloc(bufferSize), bufferSize,
-                                  ftdi_writestream_cb,
+                                  ftdi_stream_cb,
                                   &state, 0);
 
         if (!transfer->buffer)
@@ -394,8 +336,8 @@ int main(int argc, char **argv)
 {
    struct ftdi_context *ftdi;
    int err, c;
-   FILE *of = NULL;
-   char const *outfile  = 0;
+   FILE *df = NULL;
+   char const *file  = 0;
    outputFile =0;
    exitRequested = 0;
    char *descstring = NULL;
@@ -410,8 +352,8 @@ int main(int argc, char **argv)
        case 'P':
            descstring = optarg;
            break;
-       case 'n':
-           check = 0;
+       case 'r':
+           mode = READ;
            break;
        default:
            usage(argv[0]);
@@ -420,7 +362,7 @@ int main(int argc, char **argv)
    if (optind == argc - 1)
    {
        // Exactly one extra argument- a dump file
-       outfile = argv[optind];
+       file = argv[optind];
    }
    else if (optind < argc)
    {
@@ -462,16 +404,27 @@ int main(int argc, char **argv)
        fprintf(stderr,"Can't rx purge\n",ftdi_get_error_string(ftdi));
        return EXIT_FAILURE;
        }*/
-   if (outfile)
-       if ((of = fopen(outfile,"r")) == 0)
-           fprintf(stderr,"Can't open logfile %s, Error %s\n", outfile, strerror(errno));
-   if (of)
-       if (setvbuf(of, NULL, _IOFBF , 1<<16) == 0)
-           outputFile = of;
+   if (file){
+       if (mode == READ){
+           df = fopen(file,"r");
+       } else {
+           df = fopen(file,"w+");
+       }
+       if (df == 0)
+           fprintf(stderr,"Can't open logfile %s, Error %s\n", file, strerror(errno));
+   }
+   if (df){
+       if (setvbuf(df, NULL, _IOFBF , 1<<16) == 0){
+           if (mode == READ){
+               inputFile = df;
+	   } else {
+               outputFile = df;
+	   }
+       }
+   }
    signal(SIGINT, sigintHandler);
    
-//   err = ftdi_readstream(ftdi, readCallback, NULL, 8, 256);
-   err = ftdi_writestream(ftdi, writeCallback, NULL, 8, 256);
+   err = ftdi_stream(ftdi, callback, NULL, 8, 256);
    if (err < 0 && !exitRequested)
        exit(1);
    
@@ -491,125 +444,6 @@ int main(int argc, char **argv)
    ftdi_usb_close(ftdi);
    ftdi_free(ftdi);
    signal(SIGINT, SIG_DFL);
-   if (check && outfile)
-   {
-       if ((outputFile = fopen(outfile,"r")) == 0)
-       {
-           fprintf(stderr,"Can't open logfile %s, Error %s\n", outfile, strerror(errno));
-           ftdi_usb_close(ftdi);
-           ftdi_free(ftdi);
-           return EXIT_FAILURE;
-       }
-       check_outfile(descstring);
-       fclose(outputFile);
-   }
-   else if (check)
-       fprintf(stderr,"%d errors of %llu blocks (%Le), %d (%Le) blocks skipped\n",
-               n_err, (unsigned long long) blocks, (long double)n_err/(long double) blocks,
-               skips, (long double)skips/(long double) blocks);
    exit (0);
 }
 
-void check_outfile(char *descstring)
-{
-    if(strcmp(descstring,"FT2232HTEST") == 0)
-    {
-       char buf0[1024];
-       char buf1[1024];
-       char bufr[1024];
-       char *pa, *pb, *pc;
-       unsigned int num_lines = 0, line_num = 1;
-       int err_count = 0;
-       unsigned int num_start, num_end;
-
-       pa = buf0;
-       pb = buf1;
-       pc = buf0;
-       if(fgets(pa, 1023, outputFile) == NULL)
-       {
-           fprintf(stderr,"Empty output file\n");
-           return;
-       }
-       while(fgets(pb, 1023, outputFile) != NULL)
-       {
-           num_lines++;
-           unsigned int num_save = num_start;
-           if( sscanf(pa,"%6u%94s%6u",&num_start, bufr,&num_end) !=3)
-           {
-               fprintf(stdout,"Format doesn't match at line %8d \"%s",
-                       num_lines, pa);
-               err_count++;
-               line_num = num_save +2;
-           }
-           else
-           {
-               if ((num_start+1)%100000 != num_end)
-               {
-                   if (err_count < 20)
-                       fprintf(stdout,"Malformed line %d \"%s\"\n", 
-                               num_lines, pa);
-                   err_count++;
-               }
-               else if(num_start != line_num)
-               {
-                   if (err_count < 20)
-                       fprintf(stdout,"Skipping from %d to %d\n", 
-                               line_num, num_start);
-                   err_count++;
-                  
-               }
-               line_num = num_end;
-           }
-           pa = pb;
-           pb = pc;
-           pc = pa;
-       }
-       if(err_count)
-           fprintf(stdout,"\n%d errors of %d data sets %f\n", err_count, num_lines, (double) err_count/(double)num_lines);
-       else
-           fprintf(stdout,"No errors for %d lines\n",num_lines);
-   }
-    else if(strcmp(descstring,"LLBBC10") == 0)
-    { 
-        uint32_t block0[4];
-        uint32_t block1[4];
-        uint32_t *pa = block0;
-        uint32_t *pb = block1;
-        uint32_t *pc = block0;
-        uint32_t start= 0;
-        uint32_t nread = 0;
-        int n_shown = 0;
-        int n_errors = 0;
-        if (fread(pa, sizeof(uint32_t), 4,outputFile) < 4)
-        {
-            fprintf(stderr,"Empty result file\n");
-            return;
-        }
-        while(fread(pb, sizeof(uint32_t), 4,outputFile) != 0)
-        {
-            blocks++;
-            nread =  pa[0];
-            if(start>0 && (nread != start))
-            {
-                if(n_shown < 30)
-                {
-                    fprintf(stderr, "Skip %7d blocks from 0x%08x to 0x%08x at blocks %10llu \n",
-                            (nread-start)/0x4000, start -0x4000, nread, (unsigned long long) blocks);
-                    n_shown ++;
-                }
-                n_errors++;
-            }
-            else if (n_shown >0) 
-                n_shown--; 
-            start = nread + 0x4000;
-            pa = pb;
-            pb = pc;
-            pc = pa;
-        }
-        if(n_errors)
-            fprintf(stderr, "%d blocks wrong from %llu blocks read\n",
-                    n_errors, (unsigned long long) blocks);
-        else
-            fprintf(stderr, "%llu blocks all fine\n", (unsigned long long) blocks);
-    }
-}
